@@ -6,7 +6,7 @@ from ESP_Fi_model import *
 import torch
 
 
-def load_data_n_model(dataset_name, model_name, root):
+def load_data_n_model(dataset_name, model_name, pca_mode, filter_name, root):
     """
     Load ESP-Fi HAR dataset and corresponding model.
     This function acts as a centralized configuration hub, ensuring the correct
@@ -34,6 +34,12 @@ def load_data_n_model(dataset_name, model_name, root):
 
     # Run, Walk, Jump, Squat, Arm Wave, Turn, Fall
     num_classes = 7
+    input_channels = 1
+    # We keep only the three Principal Component instead of the 52 subcarriers by putting input_dim = 3
+    if pca_mode == 'PCA_Only':
+        input_dim = 3
+    else :
+        input_dim = 52
 
     # =====================
     # Model Selection & Hyperparameter Tuning
@@ -43,39 +49,37 @@ def load_data_n_model(dataset_name, model_name, root):
     # while heavy attention models (Transformer) require tiny batch sizes to prevent GPU memory crashes.
 
     if model_name == 'CNN':
-        model = CNN(num_classes)
+        model = CNN(num_classes, input_channels)
         train_epoch = 50
         batch_size = 32
 
     elif model_name == 'ResNet18':
-        model = ESP_Fi_ResNet18(num_classes)
+        model = ESP_Fi_ResNet18(num_classes, input_channels)
         train_epoch = 50
         batch_size = 32
 
     elif model_name == 'Transformer':
-        model = ESP_Fi_Transformer(num_classes)
+        model = ESP_Fi_Transformer(num_classes, input_dim, input_channels)
         train_epoch = 100
-        # Notice the tiny batch size (4)! Transformers compute "attention" between 
-        # every single time-step (950x950 matrix), which consumes massive VRAM.
         batch_size = 4
 
     elif model_name == 'GRU':
-        model = ESP_Fi_GRU(num_classes)
+        model = ESP_Fi_GRU(num_classes, input_dim, input_channels)
         train_epoch = 100
         batch_size = 64
 
     elif model_name == 'LSTM':
-        model = ESP_Fi_LSTM(num_classes)
+        model = ESP_Fi_LSTM(num_classes, input_dim, input_channels)
         train_epoch = 100
         batch_size = 32
 
     elif model_name == 'MobileNetV3':
-        model = MobileNetV3(num_classes)
+        model = MobileNetV3(num_classes, input_channels)
         train_epoch = 50
         batch_size = 32
 
     elif model_name == 'EfficientNetLite':
-        model = EfficientNetLite(num_classes)
+        model = EfficientNetLite(num_classes, input_channels)
         train_epoch = 50
         batch_size = 32
 
@@ -93,8 +97,10 @@ def load_data_n_model(dataset_name, model_name, root):
 
     env1_loader = torch.utils.data.DataLoader(
         dataset=ESP_Fi_HAR_Dataset(
-            root_dir=root,
-            split='Env.1(corridor)'
+          pca_mode=pca_mode,
+          filter_name = filter_name,
+          root_dir=root,
+          split='Env.1(corridor)'
         ),
         batch_size=batch_size, 
         shuffle=False
@@ -102,8 +108,10 @@ def load_data_n_model(dataset_name, model_name, root):
 
     env2_loader = torch.utils.data.DataLoader(
         dataset=ESP_Fi_HAR_Dataset(
-            root_dir=root,
-            split='Env.2(office)'
+          pca_mode=pca_mode,
+          filter_name = filter_name,
+          root_dir=root,
+          split='Env.2(office)'
         ),
         batch_size=batch_size, 
         shuffle=False
@@ -111,8 +119,10 @@ def load_data_n_model(dataset_name, model_name, root):
 
     env3_loader = torch.utils.data.DataLoader(
         dataset=ESP_Fi_HAR_Dataset(
-            root_dir=root,
-            split='Env.3(boardrooms)'
+          pca_mode=pca_mode,
+          filter_name = filter_name,
+          root_dir=root,
+          split='Env.3(boardrooms)'
         ),
         batch_size=batch_size, 
         shuffle=False
@@ -120,8 +130,10 @@ def load_data_n_model(dataset_name, model_name, root):
 
     env4_loader = torch.utils.data.DataLoader(
         dataset=ESP_Fi_HAR_Dataset(
-            root_dir=root,
-            split='Env.4(laboratory)'
+          pca_mode=pca_mode,
+          filter_name = filter_name,
+          root_dir=root,
+          split='Env.4(laboratory)'
         ),
         batch_size=batch_size,
         shuffle=False

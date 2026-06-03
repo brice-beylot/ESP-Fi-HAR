@@ -26,12 +26,12 @@ class ESP_Fi_MLP(nn.Module):
 
 
 class CNN(nn.Module):
-    def __init__(self, num_classes):
+    def __init__(self, num_classes, input_channels=1):
         super(CNN, self).__init__()
 
         self.features = nn.Sequential(
 
-            nn.Conv2d(in_channels=1, out_channels=32,
+            nn.Conv2d(in_channels=input_channels, out_channels=32,
                       kernel_size=(3, 3), padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
@@ -137,12 +137,12 @@ class Bottleneck(nn.Module):
 
 
 class ESP_Fi_ResNet(nn.Module):
-    def __init__(self, ResBlock, layers, num_classes):
+    def __init__(self, ResBlock, layers, num_classes, input_channels=1):
         super(ESP_Fi_ResNet, self).__init__()
         self.in_channels = 64
 
         self.preprocess = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=(3, 3), stride=(
+            nn.Conv2d(input_channels, 64, kernel_size=(3, 3), stride=(
                 1, 1), padding=1, bias=False),  # 保持尺寸
             nn.BatchNorm2d(64),
             nn.ReLU(),
@@ -190,16 +190,16 @@ class ESP_Fi_ResNet(nn.Module):
         return x
 
 
-def ESP_Fi_ResNet18(num_classes=7):
-    return ESP_Fi_ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
+def ESP_Fi_ResNet18(num_classes=7, input_channels=1):
+    return ESP_Fi_ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, input_channels=input_channels)
 
 
 class ESP_Fi_GRU(nn.Module):
-    def __init__(self, num_classes):
-        super(ESP_Fi_GRU, self).__init__()
+    def __init__(self, num_classes, input_dim=52, input_channels=1):
+        super().__init__()
 
         self.gru = nn.GRU(
-            input_size=52,
+            input_size=input_dim*input_channels,
             hidden_size=128,
             num_layers=1,
             batch_first=True
@@ -208,23 +208,25 @@ class ESP_Fi_GRU(nn.Module):
         self.fc = nn.Linear(128, num_classes)
 
     def forward(self, x):
-        # x: [B, 1, 950, 52]
-        x = x.squeeze(1)        # [B, 950, 52]
+        # x is currently [B, 2, 950, 52] (Batch, Channels, Time, Features)
+        B, C, T, F = x.shape
+        
+        # We reorder to [B, T, C, F] and then flatten the last two dimensions -> [B, 950, 104]
+        x = x.permute(0, 2, 1, 3).reshape(B, T, C * F)
 
         output, ht = self.gru(x)
-
-        feat = ht[-1]           # [B, 128]
+        feat = ht[-1]
         outputs = self.fc(feat)
 
         return outputs
 
 
 class ESP_Fi_LSTM(nn.Module):
-    def __init__(self, num_classes):
+    def __init__(self, num_classes, input_dim=52, input_channels=1):
         super().__init__()
 
         self.lstm = nn.LSTM(
-            input_size=52,
+            input_size=input_dim*input_channels,
             hidden_size=128,
             num_layers=1,
             batch_first=True
@@ -232,13 +234,15 @@ class ESP_Fi_LSTM(nn.Module):
         self.fc = nn.Linear(128, num_classes)
 
     def forward(self, x):
-        x = x.squeeze(1)
-        x = x[:, ::4, :]
+        # Flatten the channels into the features just like the GRU
+        B, C, T, F = x.shape
+        x = x.permute(0, 2, 1, 3).reshape(B, T, C * F)         
+        
+        x = x[:, ::4, :]          
 
-        output, _ = self.lstm(x)
+        output, _ = self.lstm(x)  
         feat = output.mean(dim=1)
         return self.fc(feat)
-
 
 class TimePatchEmbedding(nn.Module):
 
@@ -277,8 +281,50 @@ class TimePatchEmbedding(nn.Module):
 
         x = x + self.pos_embed
         return x
+"""
+class TimePatchEmbedding(nn.Module):
+    def __init__(self, input_dim=3, patch_size_t=50, emb_size=64):
+        super().__init__()
+        self.patch_size_t = patch_size_t
+        self.emb_size = emb_size
 
+        # The kernel now looks at 'patch_size_t' time steps (e.g., 50) 
+        # and ALL 'input_dim' features (e.g., 3 PCs) at the exact same time.
+        self.proj = nn.Conv2d(
+            in_channels=1,
+            out_channels=emb_size,
+            kernel_size=(patch_size_t, input_dim),
+            stride=(patch_size_t, 1)
+        )
 
+        self.cls_token = nn.Parameter(torch.randn(1, 1, emb_size))
+        self.pos_embed = None
+
+    def forward(self, x):
+        B = x.shape[0]
+        device = x.device
+
+        # 1. Patch the data: [B, 1, 950, 3] -> [B, 64, 19, 1]
+        x = self.proj(x)
+        
+        # 2. Squeeze out the empty last dimension: -> [B, 64, 19]
+        x = x.squeeze(-1)
+        
+        # 3. Swap axes for the Transformer: -> [Batch, Num_Patches, Emb_Size] (B, 19, 64)
+        x = x.permute(0, 2, 1)
+
+        # 4. Add the Classification (CLS) token to the front
+        cls_tokens = self.cls_token.expand(B, -1, -1).to(device)
+        x = torch.cat([cls_tokens, x], dim=1)
+
+        # 5. Add Positional Encoding so the model knows the order of time
+        seq_len = x.shape[1]
+        if self.pos_embed is None or self.pos_embed.shape[1] != seq_len:
+            self.pos_embed = nn.Parameter(torch.randn(1, seq_len, self.emb_size)).to(device)
+
+        x = x + self.pos_embed
+        return x
+"""
 class TransformerBlock(nn.Module):
     def __init__(self, emb_size=64, num_heads=8, ff_mult=4, dropout=0.2):
         super().__init__()
@@ -322,11 +368,12 @@ class ClassificationHead(nn.Module):
         cls = self.dropout(cls)
         return self.fc(cls)
 
-
 class ESP_Fi_Transformer(nn.Module):
 
     def __init__(self,
                  num_classes=7,
+                 input_dim=52,
+                 input_channels=1,
                  patch_size_t=50,
                  emb_size=64,
                  depth=4,
@@ -334,9 +381,9 @@ class ESP_Fi_Transformer(nn.Module):
                  ff_mult=4,
                  dropout=0.2):
         super().__init__()
-
+        
         self.patch_embed = TimePatchEmbedding(
-            in_channels=1,
+            in_channels=input_channels,
             patch_size_t=patch_size_t,
             emb_size=emb_size
         )
@@ -364,7 +411,49 @@ class ESP_Fi_Transformer(nn.Module):
 
         logits = self.head(x)
         return logits
+"""
+class ESP_Fi_Transformer(nn.Module):
+    def __init__(self,
+                 num_classes=7,
+                 input_dim=3,       # <-- Changed default to 3
+                 patch_size_t=50,
+                 emb_size=64,
+                 depth=4,
+                 num_heads=8,
+                 ff_mult=4,
+                 dropout=0.2):
+        super().__init__()
+        
+        self.patch_embed = TimePatchEmbedding(
+            input_dim=input_dim,    # <-- Feed the dimension into the embedder
+            patch_size_t=patch_size_t,
+            emb_size=emb_size
+        )
 
+        self.encoder = nn.ModuleList([
+            TransformerBlock(
+                emb_size=emb_size,
+                num_heads=num_heads,
+                ff_mult=ff_mult,
+                dropout=dropout
+            ) for _ in range(depth)
+        ])
+
+        self.head = ClassificationHead(
+            emb_size=emb_size,
+            num_classes=num_classes,
+            dropout=dropout + 0.1  # slightly larger dropout for classification
+        )
+
+    def forward(self, x):
+        x = self.patch_embed(x)
+
+        for block in self.encoder:
+            x = block(x)
+
+        logits = self.head(x)
+        return logits
+"""
 
 class h_sigmoid(nn.Module):
     def __init__(self, inplace=True):

@@ -2,13 +2,17 @@
 # Input size: 1 × 950 × 52 (Channels x Time x Subcarriers)
 # Modality: CSI Amplitude (CSIamp)
 
-import os
 import glob
 import numpy as np
+import os
+import random
 import scipy.io as sio
-import torch
-from torch.utils.data import Dataset, DataLoader
 from scipy.ndimage import uniform_filter1d
+from scipy.signal import butter, filtfilt, savgol_filter
+from sklearn.decomposition import PCA
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 
 class ESP_Fi_HAR_Dataset(Dataset):
     """
@@ -27,9 +31,12 @@ class ESP_Fi_HAR_Dataset(Dataset):
     Output:
         x: Tensor of shape (1, 950, 52)
         y: LongTensor label
+        path : string containing the file path
     """
 
     def __init__(self,
+                 pca_mode: str,
+                 filter_name: str,
                  root_dir: str,
                  split: str = "Env.1(corridor)",
                  modal: str = "CSIamp",
@@ -45,14 +52,16 @@ class ESP_Fi_HAR_Dataset(Dataset):
         self.root_dir = root_dir
         self.split = split
         self.modal = modal
-        self.transform = transform
+        self.pca_mode = pca_mode
+        self.filter_name = filter_name
+        self.data_augmentation = False
         
         # Define the exact order of activities. 
         # The index in this list automatically becomes the integer label (e.g., 'run' = 0, 'fall' = 6)
         self.activities = ['run', 'walk', 'jump',
                            'squat', 'arm_wave', 'turn', 'fall']
 
-        # Initialize empty lists to hold our data and labels in RAM
+        # Initialize empty lists to hold our data, labels and file paths in RAM
         self.data = []
         self.labels = []
         self.file_paths = []
@@ -114,17 +123,42 @@ class ESP_Fi_HAR_Dataset(Dataset):
                         raise ValueError(
                             f"Unexpected shape {x.shape} in {mat_path}"
                         )
+                    
+                    # ==================================================
+                    # 1. OPTIONAL FILTERING (Operates on Time Axis 0)
+                    # ==================================================
+                    if self.filter_name == "Butterworth":
+                        fs = 100
+                        nyquist = fs / 2
+                        b, a = butter(4, [0.5 / nyquist, 10.0 / nyquist], btype='band')
+                        x = filtfilt(b, a, x, axis=0)
+                        
+                    elif self.filter_name == "SG":
+                        x = savgol_filter(x, window_length=15, polyorder=3, axis=0)
 
-                    # Z-score normalization: (Value - Mean) / Standard Deviation
-                    # This forces the data to have a mean of 0 and a standard deviation of 1.
-                    # It prevents large signal spikes from destabilizing the neural network gradients.
-                    # 1e-8 is added to prevent a mathematically illegal "divide by zero" error.
+                    # ==================================================
+                    # 2. OPTIONAL PCA & RECONSTRUCTION
+                    # ==================================================
+                    if self.pca_mode != 'None':
+                        pca = PCA(n_components=3)
+                        scores = pca.fit_transform(x)
+                        
+                        if self.pca_mode == 'PCA_Reconstructed':
+                            x = pca.inverse_transform(scores)
+                        elif self.pca_mode == 'PCA_Only':
+                            x = scores
+
+                    # ==================================================
+                    # 3. NORMALIZATION & SHAPING
+                    # ==================================================
                     x = (x - np.mean(x)) / (np.std(x) + 1e-8)
 
-                    # Reshape to (1, 950, 52) to mimic a 1-channel grayscale image.
-                    # PyTorch Conv2D layers strictly require a "Channel" dimension at the front.
-                    x = x.reshape(1, 950, 52).astype(np.float32)
-
+                    # Determine the correct feature dimension
+                    feature_dim = 3 if self.pca_mode == 'PCA_Only' else 52
+                    
+                    # Reshape to (1, 950, features) 
+                    x = x.reshape(1, 950, feature_dim).astype(np.float32)
+                    
                     # Store the processed sample and its label in RAM
                     self.data.append(x)
                     self.labels.append(label)
@@ -154,28 +188,54 @@ class ESP_Fi_HAR_Dataset(Dataset):
         """
         # 1. Fetch the raw NumPy array for this specific sample
         raw_x = self.data[idx]
+        x = torch.from_numpy(raw_x.copy())
 
-        # 2. Apply the Moving Average Denoising
-        # size=5 means it averages 5 time-steps at a time. axis=-1 ensures it only smooths the time dimension.
-        smoothed_x = uniform_filter1d(raw_x, size=5, axis=-1)
-
-        # 3. Convert the smoothed NumPy array into a PyTorch Tensor
-        x = torch.from_numpy(smoothed_x.copy())
-
-        # 4. Fetch the label
+        # 2. Fetch the label
         y = torch.tensor(self.labels[idx], dtype=torch.long)
 
-        # 5. Apply any optional data augmentations (like random noise or cropping) if provided
-        if self.transform:
-            x = self.transform(x)
+        # ==========================================
+        # 3. STOCHASTIC DATA AUGMENTATION (TRAINING ONLY)
+        # ==========================================
+        if self.data_augmentation:
+            
+            # a. Amplitude Scaling (30% chance)
+            if random.random() < 0.3:
+                scale = random.uniform(0.8, 1.2)
+                x = x * scale
+                
+            # b. Gaussian Noise (30% chance)
+            if random.random() < 0.3:
+                std = random.uniform(0.01, 0.05)
+                noise = torch.randn_like(x) * std
+                x = x + noise
+                
+            # c. Time Warping (30% chance)
+            if random.random() < 0.3:
+                speed = random.uniform(0.8, 1.2)
+                
+                # Reshape for PyTorch Interpolation: (1, 950, 52) -> (1, 52, 950)
+                x = x.permute(0, 2, 1) 
+                
+                orig_len = x.shape[2]
+                warp_len = int(orig_len / speed)
+                
+                # Stretch/Compress the wave
+                x = F.interpolate(x, size=warp_len, mode='linear', align_corners=False)
+                # Resample back to exactly 950
+                x = F.interpolate(x, size=orig_len, mode='linear', align_corners=False)
+                
+                # Return to normal shape: (1, 52, 950) -> (1, 950, 52)
+                x = x.permute(0, 2, 1)
 
-        # 6. Capture the path (usefull for displaying data)
+        # 5. Capture the path (usefull for displaying data)
         path = self.file_paths[idx]
-
+        
         return x, y, path
 
 
-def get_dataloader(root_dir,
+def get_dataloader(pca_mode,
+                   filter_name,
+                   root_dir,
                    split="Env.1(corridor)",
                    batch_size=64,
                    shuffle=False,
@@ -196,6 +256,8 @@ def get_dataloader(root_dir,
     """
     # 1. Instantiate the Dataset (loads all data into RAM)
     dataset = ESP_Fi_HAR_Dataset(
+        pca_mode=pca_mode,
+        filter_name=filter_name,
         root_dir=root_dir,
         split=split,
         modal="CSIamp"
