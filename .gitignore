@@ -1,0 +1,20 @@
+# Environments
+.venv/
+__pycache__/
+*.py[cod] # Compiled Python files
+*$py.class
+
+# OS generated files
+.DS_Store
+Thumbs.db 
+
+# IDE/Editor
+.vscode/
+*.swp # Vim swap files
+*.swo
+
+# logs
+training_logs/final_test_results*
+training_logs/*.pth
+training_logs/*.png
+training_logs/*.pdf

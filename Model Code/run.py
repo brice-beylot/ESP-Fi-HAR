@@ -1,0 +1,555 @@
+# Main Training Engine for ESP-Fi HAR
+# Handles Model Training, Evaluation, Cross-Validation, and Logging
+
+import argparse
+import copy
+import csv
+from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+import numpy as np
+import os
+import random
+import scipy.io as sio
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, f1_score
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import ConcatDataset, DataLoader
+
+from dataset import ESP_Fi_HAR_Dataset
+from util import load_data_n_model
+
+
+def set_random_seed(seed=666):
+    """
+    Forces PyTorch, NumPy, and Python to use the exact same random numbers every time.
+    Why? Because neural networks initialize with random weights. If you don't lock the seed, 
+    running the exact same code twice will give you slightly different F1 scores, making it 
+    impossible to tell if your code changes actually improved the model or if you just got lucky.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+
+def export_errors_to_pdf(error_list, success_dict, output_pdf="misclassified_falls.pdf"):
+    if not error_list:
+        print("No fall-related errors to plot!")
+        return
+
+    activity_names = ['Run', 'Walk', 'Jump', 'Squat', 'Arm Wave', 'Turn', 'Fall']
+    
+    with PdfPages(output_pdf) as pdf:
+        for item in error_list:
+            err_path = item['path']
+            xyz_key = item['xyz_key']
+            true_act = activity_names[item['true']]
+            pred_act = activity_names[item['pred']]
+            err_filename = os.path.basename(err_path)
+            
+            # Load Error Data
+            err_mat = sio.loadmat(err_path)['CSIamp']
+            if err_mat.shape == (52, 950): err_mat = err_mat.T
+                
+            # Try to find a baseline from the exact same Env-Subject-Action
+            baseline_path = None
+            if xyz_key in success_dict and len(success_dict[xyz_key]) > 0:
+                baseline_path = success_dict[xyz_key][0] # Grab the first successful trial
+                
+            if baseline_path:
+                # We found a baseline! Draw two stacked graphs.
+                base_filename = os.path.basename(baseline_path)
+                base_mat = sio.loadmat(baseline_path)['CSIamp']
+                if base_mat.shape == (52, 950): base_mat = base_mat.T
+                    
+                fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharey=True)
+                
+                # Top graph: The Error
+                axes[0].plot(err_mat)
+                axes[0].set_title(f"MISCLASSIFIED: {err_filename} | True: {true_act} -> Pred: {pred_act}", color='red')
+                axes[0].grid(True, alpha=0.3)
+                
+                # Bottom graph: The Golden Baseline
+                axes[1].plot(base_mat)
+                axes[1].set_title(f"CORRECT BASELINE: {base_filename} | True: {true_act} -> Pred: {true_act}", color='green')
+                axes[1].set_xlabel("Sample Time")
+                axes[1].grid(True, alpha=0.3)
+                
+                fig.supylabel("Subcarrier Amplitude")
+                plt.tight_layout()
+                
+                pdf.savefig(fig) # Save the stacked figure to the PDF
+                plt.close(fig)
+                
+            else:
+                # No baseline exists (the model failed all times for this subject)
+                fig = plt.figure(figsize=(10, 4))
+                plt.plot(err_mat)
+                plt.title(f"MISCLASSIFIED: {err_filename} | True: {true_act} -> Pred: {pred_act}\n(No correct baseline found for comparison)", color='orange')
+                plt.xlabel("Sample Time")
+                plt.ylabel("Subcarrier Amplitude")
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                
+                pdf.savefig(fig) # Save the single figure to the PDF
+                plt.close(fig)
+
+    print(f"Success! Created {output_pdf} with {len(error_list)} samples.")
+
+def show_errors_inline(error_list, success_dict):
+    if not error_list:
+        print("No fall-related errors to plot!")
+        return
+
+    activity_names = ['Run', 'Walk', 'Jump', 'Squat', 'Arm Wave', 'Turn', 'Fall']
+    
+    for item in error_list:
+        err_path = item['path']
+        xyz_key = item['xyz_key']
+        true_act = activity_names[item['true']]
+        pred_act = activity_names[item['pred']]
+        err_filename = os.path.basename(err_path)
+        
+        # Load Error Data
+        err_mat = sio.loadmat(err_path)['CSIamp']
+        if err_mat.shape == (52, 950): err_mat = err_mat.T
+            
+        # Try to find a baseline from the exact same Env-Subject-Action
+        baseline_path = None
+        if xyz_key in success_dict and len(success_dict[xyz_key]) > 0:
+            baseline_path = success_dict[xyz_key][0] # Grab the first successful trial
+            
+        if baseline_path:
+            # We found a baseline! Draw two stacked graphs.
+            base_filename = os.path.basename(baseline_path)
+            base_mat = sio.loadmat(baseline_path)['CSIamp']
+            if base_mat.shape == (52, 950): base_mat = base_mat.T
+                
+            fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharey=True)
+            
+            # Top graph: The Error
+            axes[0].plot(err_mat)
+            axes[0].set_title(f"MISCLASSIFIED: {err_filename} | True: {true_act} -> Pred: {pred_act}", color='red')
+            axes[0].grid(True, alpha=0.3)
+            
+            # Bottom graph: The Golden Baseline
+            axes[1].plot(base_mat)
+            axes[1].set_title(f"CORRECT BASELINE: {base_filename} | True: {true_act} -> Pred: {true_act}", color='green')
+            axes[1].set_xlabel("Sample Time")
+            axes[1].grid(True, alpha=0.3)
+            
+            fig.supylabel("Subcarrier Amplitude")
+            plt.tight_layout()
+            plt.show()
+            
+        else:
+            # No baseline exists (the model failed 10/10 times for this subject)
+            plt.figure(figsize=(10, 4))
+            plt.plot(err_mat)
+            plt.title(f"MISCLASSIFIED: {err_filename} | True: {true_act} -> Pred: {pred_act}\n(No correct baseline found for comparison)", color='orange')
+            plt.xlabel("Sample Time")
+            plt.ylabel("Subcarrier Amplitude")
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.show()
+
+def evaluate(model, model_name, loader, criterion, device, save_cm=False, collect_errors=False):
+    """
+    Tests the model's current performance without updating its weights.
+    """
+    # model.eval() changes how certain layers (like Dropout or BatchNorm) behave.
+    # It ensures the model acts deterministically during testing.
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    error_receipts = []
+    success_dict = {}
+
+    # CRITICAL: torch.no_grad() turns off PyTorch's gradient tracking engine.
+    # Because we are just testing, we don't need to calculate derivatives.
+    # This massively speeds up testing and cuts memory usage in half.
+    with torch.no_grad():
+        for inputs, labels, paths in loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device).long()
+
+            # Forward pass: the model makes its guesses
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            # Accumulate the total loss for the batch
+            total_loss += loss.item() * inputs.size(0)
+
+            # The output is a probability array for all 7 classes. 
+            # argmax picks the index (0-6) with the highest probability.
+            preds = torch.argmax(outputs, dim=1)
+
+            # Storage of classified and misclassified samples regarding the fall detection for the plot
+            if collect_errors:
+                for i in range(len(labels)):
+                    p = preds[i].item()
+                    l = labels[i].item()
+                    path = paths[i]
+                    
+                    # Extract the X-Y-Z signature from the file name (e.g., "1-2-7-10.mat" -> "1-2-7")
+                    filename = os.path.basename(path)
+                    parts = filename.split('-')
+                    if len(parts) >= 4:
+                        xyz_key = f"{parts[0]}-{parts[1]}-{parts[2]}"
+                    else:
+                        xyz_key = "unknown"
+
+                    if p == l:
+                        # Save a well classified path sample in the dictionnary for a potential comparison
+                        if xyz_key not in success_dict:
+                            success_dict[xyz_key] = []
+                        success_dict[xyz_key].append(path)
+                        
+                    elif p != l and (p == 6 or l == 6):
+                        # Save a misclassified sample, but attach the xyz_key so we can look up a baseline later!
+                        error_receipts.append({
+                            'path': path,
+                            'true': l,
+                            'pred': p,
+                            'xyz_key': xyz_key
+                        })
+            
+            # Move the tensors off the GPU (cpu) and into standard NumPy arrays
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    # Generate and save the Confusion Matrix image (usually only on the last epoch)
+    if save_cm:  
+        cm = confusion_matrix(
+            all_labels, all_preds, labels=[0, 1, 2, 3, 4, 5, 6])
+        print("Confusion matrix :", cm)
+
+        # Normalize the matrix to show percentages instead of raw sample counts
+        cmn = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        print("Normalized confusion matrix :", cmn)
+        target_names = ['Run', 'Walk', 'Jump',
+                        'Squat', 'Arm swing', 'Turn', 'Fall']
+        fig, ax = plt.subplots(figsize=(10, 10))
+        sns.heatmap(cmn, annot=True, fmt='.2f', cmap='Blues',
+                    xticklabels=target_names, yticklabels=target_names)
+        plt.ylabel('Actual Activity (True Label)')
+        plt.xlabel('Predicted Activity (Model Output)')
+        plt.title('ESP-Fi HAR Normalized Confusion Matrix')
+        plt.savefig(f'training_logs/confusion_matrix_{model_name}.png', dpi=300, bbox_inches='tight')
+
+    avg_loss = total_loss / len(loader.dataset)
+    acc = np.mean(np.array(all_preds) == np.array(all_labels))
+    
+    # Calculation of the F1 score explicitly isolating the "fall" state.
+    # average=None returns an array of 7 independent F1 scores.
+    f1_scores_per_class = f1_score(all_labels, all_preds, average=None)
+    
+    # Dynamically find the index for 'fall' so we don't have to hardcode '6'
+    index = loader.dataset.activities.index('fall')
+    fall_f1 = f1_scores_per_class[index]
+
+    return acc, fall_f1, avg_loss, error_receipts, success_dict
+
+
+def train(model, train_loader, test_loader, num_epochs,
+          learning_rate, criterion, device,
+          csv_path, model_real_name, model_name, continue_training, plot_errors):
+    """
+    The main training loop for a single model (One fold of Cross-Validation).
+    """
+    model = model.to(device)
+
+    # AdamW is an advanced optimizer that updates the neural network's weights based on the loss.
+    # weight_decay adds L2 regularization to prevent the model from overfitting to the training data.
+    optimizer = optim.AdamW(model.parameters(),
+                            lr=learning_rate,
+                            weight_decay=1e-4)
+
+    # A learning rate scheduler slowly drops the learning rate as epochs progress.
+    # This helps the model take smaller, more careful steps as it gets closer to the optimal answer.
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+    # Initialize the AMP Gradient Scaler
+    scaler = torch.amp.GradScaler('cuda')
+
+    os.makedirs(csv_path, exist_ok=True)
+
+    # Note: model_name here includes the Fold Number so they don't overwrite each other!
+    train_csv = os.path.join(csv_path, f'training_results_{model_name}.csv')
+    final_test_csv = os.path.join(csv_path, f'final_test_results_{model_real_name}.csv')
+
+    best_test_loss = float('inf')
+    best_test_fall_f1 = 0
+
+    best_model_path = os.path.join(csv_path, f'best_model_{model_name}.pth')
+
+    if continue_training and os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        print(f"Continuing training from checkpoint: {best_model_path}")
+        print("\nEvaluating loaded checkpoint before training...")
+        init_acc, init_f1, init_loss = evaluate(model, model_name, test_loader, criterion, device)
+        print(f"Loaded Checkpoint -> TestAcc: {init_acc:.4f} | F1: {init_f1:.4f} | TestLoss: {init_loss:.4f}\n")
+        best_test_loss = init_loss
+    else:
+        print("No checkpoint found. Starting training from scratch.")
+
+    # ==================================
+    # THE EPOCH LOOP
+    # ==================================
+    for epoch in range(num_epochs):
+        model.train() # Tell PyTorch we are actively learning
+
+        running_loss = 0
+        correct = 0
+        total = 0
+
+        for inputs, labels, paths in train_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device).long()
+
+            # 1. Clear the old gradients. PyTorch accumulates them by default, 
+            #    so if we don't wipe them, step 2 will mix with step 1!
+            optimizer.zero_grad()
+            
+            # 2. Forward pass (make a prediction) inside the AMP Autocast context
+            #    This automatically casts sensitive operations to 32-bit and safe ones to 16-bit!
+            with torch.amp.autocast('cuda'):
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+            
+            # 3. Backward pass (calculate exactly how wrong each weight was)
+            #    We use the scaler to prevent 16-bit gradient underflow
+            scaler.scale(loss).backward()
+            
+            # 4. Optimizer step (adjust the weights to be slightly more accurate)
+            scaler.step(optimizer)
+
+            # 5. Update the scaler for the next batch
+            scaler.update()
+
+            running_loss += loss.item() * inputs.size(0)
+
+            preds = torch.argmax(outputs, dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+        # Calculate average metrics for this epoch
+        train_loss = running_loss / len(train_loader.dataset)
+        train_acc = correct / total
+
+        # Test the model on the unseen Fold data.
+        # save_cm=(epoch == num_epochs-1) ensures we only generate the heatmap image on the very last epoch.
+        test_acc, test_fall_f1, test_loss, final_errors, final_successes = evaluate(
+            model, model_name, test_loader, criterion, device, save_cm=(epoch == num_epochs-1)
+        )
+
+        print(
+            f"Epoch [{epoch+1}/{num_epochs}] "
+            f"TrainAcc: {train_acc:.4f} "
+            f"TrainLoss: {train_loss:.4f} "
+            f"TestAcc: {test_acc:.4f} "
+            f"F1: {test_fall_f1:.4f} "
+            f"TestLoss: {test_loss:.4f}"
+        )
+
+        # Save the model state strictly based on its ability to detect the "Fall" class
+        if test_fall_f1 > best_test_fall_f1 :
+            best_test_fall_f1 = test_fall_f1
+            torch.save(model.state_dict(), best_model_path)
+
+        # Lower the learning rate slightly
+        scheduler.step()
+
+    print("\nTraining completed.")
+    print(f"Best Test Fall F1: {best_test_fall_f1:.4f}")
+
+    # ==================================
+    # POST-TRAINING EVALUATION
+    # ==================================
+    print("\nEvaluating Best Model on Test Set...")
+
+    # Load the best weights discovered during the epoch loop
+    model.load_state_dict(torch.load(best_model_path))
+    model = model.to(device)
+
+    final_test_acc, final_test_fall_f1, final_test_loss, final_errors, final_successes = evaluate(
+        model, model_name, test_loader, criterion, device, collect_errors = plot_errors
+    )
+
+    print("\n========== Final Test Results ==========")
+    print(f"Test Accuracy : {final_test_acc:.4f}")
+    print(f"Test Macro-F1 : {final_test_fall_f1:.4f}")
+    print(f"Test Loss     : {final_test_loss:.6f}")
+    print("========================================\n")
+
+    # Safe appending logic: Write header if file is empty, otherwise just append rows
+    file_exists = os.path.exists(final_test_csv) and os.path.getsize(final_test_csv) > 0
+    with open(final_test_csv, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(['Model', 'TestAccuracy', 'TestMacroF1', 'TestLoss'])
+        writer.writerow([
+            model_name,
+            final_test_acc,
+            final_test_fall_f1,
+            final_test_loss
+        ])
+
+    print(f"Final test results saved to: {final_test_csv}")
+    print(f"Training logs saved to: {train_csv}")
+
+    # Delete the .pth file containing the weights of the model in order to save space
+    if os.path.exists(best_model_path):
+        os.remove(best_model_path)
+        print(f"Deleted model checkpoint to save space: {best_model_path}")
+
+    return best_model_path, final_test_fall_f1, final_errors, final_successes
+
+
+def main():
+    root = './Data'
+    csv_path = './training_logs/'
+
+    torch.cuda.empty_cache()
+    set_random_seed(seed=666)
+
+    parser = argparse.ArgumentParser('ESP-Fi HAR Benchmark')
+
+    parser.add_argument('--dataset',
+                        choices=['ESP-Fi_HAR'],
+                        default='ESP-Fi_HAR')
+
+    parser.add_argument('--model',
+                        choices=[
+                            'CNN', 'ResNet18',
+                            'GRU', 'LSTM', 'Transformer',
+                            'MobileNetV3', 'EfficientNetLite'
+                        ],
+                        required=True)
+
+    parser.add_argument('--runs', type=int, default=200,
+                        help='Number of runs for each model (for stability)')
+
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path to model checkpoint (.pth) for latency test')
+
+    parser.add_argument('--continue_training', type=bool, default=False,
+                        help='Continue training from the best checkpoint if available')
+    
+    parser.add_argument('--plot_errors', action='store_true',
+                        help='If flagged, generates a PDF of all misclassified Fall samples')
+
+    args = parser.parse_args()
+
+    # Call our Factory function to build the correct datasets and architecture
+    data_loader, model, train_epoch = \
+        load_data_n_model(args.dataset, args.model, root)
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+    
+    criterion = nn.CrossEntropyLoss()
+
+    # ==========================================================
+    # LEAVE-ONE-ENVIRONMENT-OUT (LOEO) CROSS-VALIDATION LOOP
+    # ==========================================================
+
+    # Take a "photograph" of the completely untrained, random model weights.
+    # We must reset the model to this blank state before every fold to prevent data leakage!
+    initial_model_weights = copy.deepcopy(model.state_dict())
+
+    all_fold_fall_f1_scores = []
+
+    for k in range(len(data_loader)):
+        print(f"\n{'='*50}")
+        print(f"Starting Cross-Validation Fold {k+1}/4")
+        print(f"Testing on Environment {k+1}, Training on the other 3")
+        print(f"{'='*50}")
+
+        # 1. Isolate the current environment to be the Test Set
+        test_loader = data_loader[k]
+
+        # 2. Collect the datasets from the remaining 3 environments
+        train_datasets = []
+        for i in range(len(data_loader)):
+            if i != k:
+                train_datasets.append(data_loader[i].dataset)
+
+        # 3. Glue the 3 datasets together into one massive training set
+        combined_train_dataset = ConcatDataset(train_datasets)
+
+        # 4. Wrap the massive dataset in a new DataLoader and SHUFFLE it
+        batch_size = test_loader.batch_size 
+        train_loader = DataLoader(
+            dataset=combined_train_dataset,
+            batch_size=batch_size,
+            shuffle=True
+        )
+
+        # 5. Wipe the model's memory by injecting the untrained weights back in
+        model.load_state_dict(initial_model_weights)
+
+        # 6. Execute the full training loop for this specific fold
+        best_model_path, best_fold_fall_f1, fold_errors, fold_successes = train(model=model,
+              train_loader=train_loader,
+              test_loader=test_loader,
+              num_epochs=train_epoch,
+              learning_rate=1e-3,
+              criterion=criterion,
+              device=device,
+              csv_path=csv_path,
+              model_real_name=f"{args.model}",
+              model_name=f"{args.model}_LOEO_Fold_{k+1}", # Pass the fold number to name the files!
+              continue_training=args.continue_training,
+              plot_errors=args.plot_errors
+              )
+
+        all_fold_fall_f1_scores.append(best_fold_fall_f1)
+        print(f"Fold {k + 1} Finished! Best F1: {best_fold_fall_f1}")
+
+        # If the trigger is True, generate the PDF for THIS specific environment immediately
+        if args.plot_errors and fold_errors:
+            print(f"\n[Trigger Activated] Plotting misclassified samples for Environment {k+1}...")
+            # We dynamically name the file to include "Env1", "Env2", etc.
+            pdf_name = f"{args.model}_Env{k+1}_misclassified_falls.pdf"
+            pdf_path = os.path.join(csv_path, pdf_name)
+            export_errors_to_pdf(fold_errors, fold_successes, output_pdf=pdf_path)
+            """
+            show_errors_inline(fold_errors, fold_successes)
+            """
+    
+    # ==========================================================
+    # AGGREGATE RESULTS
+    # ==========================================================
+    # This globally saves the ultimate cross-validation average for the chosen model
+    fall_f1_mean_results = os.path.join(
+        csv_path,
+        'LOEO_fall_f1_mean_results.csv'
+    )
+
+    final_mean_fall_f1 = sum(all_fold_fall_f1_scores) / len(data_loader)
+    print(f"FINAL CROSS-VALIDATION SCORE: F1 = {final_mean_fall_f1}")
+
+    # Safe appending logic again for the global tracker
+    file_exists = os.path.exists(fall_f1_mean_results) and os.path.getsize(fall_f1_mean_results) > 0
+    with open(fall_f1_mean_results, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(['Model', 'Fall F1 Mean Loss'])
+        writer.writerow([
+            f"{args.model}",
+            final_mean_fall_f1
+        ])
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+Model,Preprocessing,TestAccuracy,TestMacroF1,TestLoss
+EfficientNetLite,PCA_Reconstructed+SG_LOEO_Fold_1,0.6375,0.8333,1.5773
+EfficientNetLite,PCA_Reconstructed+SG_LOEO_Fold_2,0.6054,0.7746,1.4444
+EfficientNetLite,PCA_Reconstructed+SG_LOEO_Fold_3,0.7125,0.8249,1.3500
+EfficientNetLite,PCA_Reconstructed+SG_LOEO_Fold_4,0.6571,0.8250,1.7421
