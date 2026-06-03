@@ -14,7 +14,7 @@ Thumbs.db
 *.swo
 
 # logs
-training_logs/final_test_results*
-training_logs/*.pth
-training_logs/*.png
-training_logs/*.pdf
+Model Code/training_logs/final_test_results*
+Model Code/training_logs/*.pth
+Model Code/training_logs/*.png
+Model Code/training_logs/*.pdf
